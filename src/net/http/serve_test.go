@@ -6726,27 +6726,123 @@ func testMaxBytesHandler(t *testing.T, maxSize, requestSize int64) {
 	}
 }
 
-// Issue 48642: close accepted connection
-func TestServerCloseAccepted(t *testing.T) {
-	closed := 0
-	conn := &rwTestConn{
-		closeFunc: func() error {
-			closed++
-			return nil
-		},
+type wrapConnListener struct {
+	net.Listener
+	wrap func(net.Conn) net.Conn
+}
+
+func (l *wrapConnListener) Accept() (c net.Conn, err error) {
+	c, err = l.Listener.Accept()
+	if err != nil {
+		return nil, err
 	}
-	ln := &oneConnListener{conn: conn}
-	var srv Server
-	// Use ConnContext to close server after connection is accepted but before it is tracked
-	srv.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
-		srv.Close()
-		return ctx
+	c = l.wrap(c)
+	return
+}
+
+type trackCloseConn struct {
+	net.Conn
+	closes chan<- error
+}
+
+func (p *trackCloseConn) Close() error {
+	err := p.Conn.Close()
+	p.closes <- err
+	return err
+}
+
+// Issue 48642: close accepted connection when Closed
+func TestAcceptedConnectionWhenClosed(t *testing.T) {
+	defer afterTest(t)
+	closes := make(chan error, 1)
+	done := make(chan error, 1)
+
+	setup := func(srv *httptest.Server) {
+		srv.Listener = &wrapConnListener{srv.Listener, func(c net.Conn) net.Conn {
+			return &trackCloseConn{c, closes}
+		}}
+		s := srv.Config
+		// Use ConnContext to close the server after connection is accepted but before it is tracked
+		s.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
+			done <- s.Close()
+			return ctx
+		}
 	}
-	got := srv.Serve(ln)
-	if got != ErrServerClosed {
-		t.Errorf("Serve err = %v; want ErrServerClosed", got)
+	handler := HandlerFunc(func(w ResponseWriter, r *Request) {
+		io.WriteString(w, "test content")
+	})
+
+	cst := newClientServerTest(t, h1Mode /* the test is protocol-agnostic */, handler, setup)
+	defer cst.close()
+
+	res, err := cst.c.Get(cst.ts.URL)
+	if err == nil {
+		res.Body.Close()
+		t.Fatalf("expected error from Get")
 	}
-	if closed != 1 {
-		t.Errorf("Connection expected to be closed")
+
+	<-done
+
+	select {
+	case err := <-closes:
+		if err != nil {
+			t.Fatal("expected no error from Close")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for Close")
+	}
+}
+
+// Issue 33313 and 36819: serve accepted connection when Shutdown
+func TestAcceptedConnectionWhenShutdown(t *testing.T) {
+	defer afterTest(t)
+	closes := make(chan error, 1)
+	done := make(chan error, 1)
+
+	setup := func(srv *httptest.Server) {
+		srv.Listener = &wrapConnListener{srv.Listener, func(c net.Conn) net.Conn {
+			return &trackCloseConn{c, closes}
+		}}
+		s := srv.Config
+		inShutdown := make(chan struct{})
+		s.RegisterOnShutdown(func() { close(inShutdown) })
+		// Use ConnContext to shutdown the server after connection is accepted but before it is tracked
+		s.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
+			go func() { done <- s.Shutdown(context.Background()) }()
+			<-inShutdown
+			return ctx
+		}
+	}
+	handler := HandlerFunc(func(w ResponseWriter, r *Request) {
+		io.WriteString(w, "test content")
+	})
+
+	cst := newClientServerTest(t, h1Mode /* the test is protocol-agnostic */, handler, setup)
+	defer cst.close()
+
+	res, err := cst.c.Get(cst.ts.URL)
+	if err != nil {
+		t.Fatalf("Get error: %v", err)
+	}
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	res.Body.Close()
+
+	content := string(body)
+	if content != "test content" {
+		t.Fatalf("unexpected content: %s", content)
+	}
+
+	<-done
+
+	select {
+	case err := <-closes:
+		if err != nil {
+			t.Fatal("expected no error from Close")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for Close")
 	}
 }

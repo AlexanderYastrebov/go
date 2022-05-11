@@ -2655,7 +2655,8 @@ type Server struct {
 	// value.
 	ConnContext func(ctx context.Context, c net.Conn) context.Context
 
-	inShutdown atomicBool // true when server is in shutdown
+	inShutdown atomicBool // true if Shutdown was called
+	inClose    atomicBool // true if Close was called
 
 	disableKeepAlives int32     // accessed atomically.
 	nextProtoOnce     sync.Once // guards setupHTTP2_* init
@@ -2703,7 +2704,8 @@ func (s *Server) closeDoneChanLocked() {
 // Close returns any error returned from closing the Server's
 // underlying Listener(s).
 func (srv *Server) Close() error {
-	srv.inShutdown.setTrue()
+	srv.inClose.setTrue()
+
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 	srv.closeDoneChanLocked()
@@ -2955,7 +2957,7 @@ func AllowQuerySemicolons(h Handler) Handler {
 // ListenAndServe always returns a non-nil error. After Shutdown or Close,
 // the returned error is ErrServerClosed.
 func (srv *Server) ListenAndServe() error {
-	if srv.shuttingDown() {
+	if srv.inShutdown.isSet() || srv.inClose.isSet() {
 		return ErrServerClosed
 	}
 	addr := srv.Addr
@@ -3133,7 +3135,7 @@ func (s *Server) trackListener(ln *net.Listener, add bool) bool {
 		s.listeners = make(map[*net.Listener]struct{})
 	}
 	if add {
-		if s.shuttingDown() {
+		if s.inShutdown.isSet() || s.inClose.isSet() {
 			return false
 		}
 		s.listeners[ln] = struct{}{}
@@ -3144,11 +3146,11 @@ func (s *Server) trackListener(ln *net.Listener, add bool) bool {
 }
 
 // trackConn adds a connection to the set of tracked connections.
-// It reports whether the server is still up (not Shutdown or Closed).
+// It reports whether the server is still up or in graceful shutdown (not Closed).
 func (s *Server) trackConn(c *conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.shuttingDown() {
+	if s.inClose.isSet() {
 		return false
 	}
 	if s.activeConn == nil {
@@ -3173,11 +3175,7 @@ func (s *Server) readHeaderTimeout() time.Duration {
 }
 
 func (s *Server) doKeepAlives() bool {
-	return atomic.LoadInt32(&s.disableKeepAlives) == 0 && !s.shuttingDown()
-}
-
-func (s *Server) shuttingDown() bool {
-	return s.inShutdown.isSet()
+	return atomic.LoadInt32(&s.disableKeepAlives) == 0 && !s.inShutdown.isSet() && !s.inClose.isSet()
 }
 
 // SetKeepAlivesEnabled controls whether HTTP keep-alives are enabled.
@@ -3255,7 +3253,7 @@ func ListenAndServeTLS(addr, certFile, keyFile string, handler Handler) error {
 // ListenAndServeTLS always returns a non-nil error. After Shutdown or
 // Close, the returned error is ErrServerClosed.
 func (srv *Server) ListenAndServeTLS(certFile, keyFile string) error {
-	if srv.shuttingDown() {
+	if srv.inShutdown.isSet() || srv.inClose.isSet() {
 		return ErrServerClosed
 	}
 	addr := srv.Addr
