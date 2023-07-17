@@ -11,6 +11,7 @@ package http
 
 import (
 	"bufio"
+	"compress/flate"
 	"compress/gzip"
 	"container/list"
 	"context"
@@ -2795,6 +2796,7 @@ type bodyEOFSignal struct {
 }
 
 var errReadOnClosedResBody = errors.New("http: read on closed response body")
+var errConcurrentReadOnResBody = errors.New("http: concurrent read on response body")
 
 func (es *bodyEOFSignal) Read(p []byte) (n int, err error) {
 	es.mu.Lock()
@@ -2844,37 +2846,90 @@ func (es *bodyEOFSignal) condfn(err error) error {
 }
 
 // gzipReader wraps a response body so it can lazily
-// call gzip.NewReader on the first call to Read
+// get gzip.Reader from the pool on the first call to Read.
+// After Close is called it puts gzip.Reader to the pool immediately
+// if there is no Read in progress or later when Read completes.
 type gzipReader struct {
 	_    incomparable
 	body *bodyEOFSignal // underlying HTTP/1 response body framing
-	zr   *gzip.Reader   // lazily-initialized gzip reader
-	zerr error          // any error from gzip.NewReader; sticky
+
+	once  sync.Once
+	state atomic.Int32
+	zr    *gzip.Reader // lazily-initialized gzip reader
+	zerr  error        // any error from gzip.Reader.Reset; sticky
+}
+
+const (
+	gzipReaderAvailable = iota
+	gzipReaderReading
+	gzipReaderClosed
+)
+
+type eofReader struct{}
+
+func (eofReader) Read([]byte) (int, error) { return 0, io.EOF }
+func (eofReader) ReadByte() (byte, error)  { return 0, io.EOF }
+
+var (
+	gzipPool = sync.Pool{New: func() any { return new(gzip.Reader) }}
+
+	// parkedReader used to reset gzip.Reader before returning into the gzipPool as
+	// gzip.Reader.Reset(flate.Reader) avoids calling bufio.NewReader
+	parkedReader flate.Reader = eofReader{}
+)
+
+func gzipPoolPut(zr *gzip.Reader) {
+	_ = zr.Reset(parkedReader)
+	gzipPool.Put(zr)
 }
 
 func (gz *gzipReader) Read(p []byte) (n int, err error) {
-	if gz.zr == nil {
+	gz.once.Do(func() {
+		zr := gzipPool.Get().(*gzip.Reader)
+		gz.zerr = zr.Reset(gz.body)
 		if gz.zerr == nil {
-			gz.zr, gz.zerr = gzip.NewReader(gz.body)
+			gz.zr = zr
+			gz.state.Store(gzipReaderAvailable)
+		} else {
+			gzipPoolPut(zr)
 		}
-		if gz.zerr != nil {
-			return 0, gz.zerr
+	})
+
+	if gz.zerr != nil {
+		return 0, gz.zerr
+	}
+
+	if !gz.state.CompareAndSwap(gzipReaderAvailable, gzipReaderReading) {
+		// safe to check gzipReaderClosed because it is terminal
+		if gz.state.Load() == gzipReaderClosed {
+			return 0, errReadOnClosedResBody
+		} else {
+			return 0, errConcurrentReadOnResBody
 		}
 	}
 
-	gz.body.mu.Lock()
-	if gz.body.closed {
-		err = errReadOnClosedResBody
-	}
-	gz.body.mu.Unlock()
+	n, err = gz.zr.Read(p)
 
-	if err != nil {
-		return 0, err
+	if !gz.state.CompareAndSwap(gzipReaderReading, gzipReaderAvailable) {
+		gzipPoolPut(gz.zr)
+		gz.zr = nil
 	}
-	return gz.zr.Read(p)
+
+	return
 }
 
 func (gz *gzipReader) Close() error {
+	gz.once.Do(func() {
+		gz.zerr = errReadOnClosedResBody
+	})
+
+	if gz.zerr == nil {
+		if gz.state.Swap(gzipReaderClosed) == gzipReaderAvailable {
+			gzipPoolPut(gz.zr)
+			gz.zr = nil
+		}
+	}
+
 	return gz.body.Close()
 }
 
