@@ -5,6 +5,7 @@
 package http_test
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"errors"
@@ -1557,5 +1558,48 @@ func testFileServerMethods(t *testing.T, mode testMode) {
 		if got, want := res.Header.Get("Content-Length"), fmt.Sprint(len(file)); got != want {
 			t.Fatalf("%v: got Content-Length %q, want %q", method, got, want)
 		}
+	}
+}
+
+func TestFileServerZip(t *testing.T) {
+	run(t, testFileServerZip)
+}
+func testFileServerZip(t *testing.T, mode testMode) {
+	zr, err := zip.OpenReader("../../archive/zip/testdata/unix.zip")
+	if err != nil {
+		t.Fatal("reading file:", err)
+	}
+	defer zr.Close()
+
+	ts := newClientServerTest(t, mode, FileServer(FS(zr))).ts
+
+	get := func(path string) string {
+		t.Helper()
+		req, _ := NewRequest("GET", ts.URL+path, nil)
+		res, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(res.Body)
+		res.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.StatusCode != StatusOK {
+			t.Fatalf("got status %v, want %v", res.StatusCode, StatusOK)
+		}
+		return string(body)
+	}
+
+	if got, want := get("/hello"), "world \r\n"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+
+	if got, want := get("/readonly"), "important \r\n"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+
+	if got, want := get("/dir/bar"), "foo \r\n"; got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }

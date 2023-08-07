@@ -767,6 +767,21 @@ type ioFile struct {
 	file fs.File
 }
 
+// ioFileStreamSeeker wraps ioFile, keeps track of current position and stores
+// up to sniffLen last read bytes in the buffer to implement limited io.Seeker.
+// If resulting Seek offset from the start of the file is past current position
+// it will read and discard bytes until offset is reached.
+// If resulting offset is not before current position minus the buffer size
+// it will trim the buffer and update the position, otherwise it will return an error.
+type ioFileStreamSeeker struct {
+	ioFile
+	pos    int64
+	readAt int
+	buf    []byte
+}
+
+var _ File = &ioFileStreamSeeker{}
+
 func (f ioFS) Open(name string) (File, error) {
 	if name == "/" {
 		name = "."
@@ -779,7 +794,10 @@ func (f ioFS) Open(name string) (File, error) {
 			return fs.Stat(f.fsys, path)
 		})
 	}
-	return ioFile{file}, nil
+	if _, ok := file.(io.Seeker); ok {
+		return ioFile{file}, nil
+	}
+	return &ioFileStreamSeeker{ioFile: ioFile{file}, buf: make([]byte, 0, sniffLen)}, nil
 }
 
 func (f ioFile) Close() error               { return f.file.Close() }
@@ -829,6 +847,75 @@ func (f ioFile) Readdir(count int) ([]fs.FileInfo, error) {
 		}
 	}
 	return list, nil
+}
+
+func (f *ioFileStreamSeeker) Read(b []byte) (n int, err error) {
+	if f.readAt < len(f.buf) {
+		n = copy(b, f.buf[f.readAt:])
+		f.readAt += n
+		f.pos += int64(n)
+
+		if f.readAt < len(f.buf) {
+			return
+		} else {
+			b = b[n:]
+		}
+	}
+
+	m, err := f.ioFile.Read(b)
+
+	if m > 0 {
+		f.pos += int64(m)
+		n += m
+
+		start := 0
+		left := cap(f.buf) - len(f.buf)
+		if m > left {
+			extra := m - left
+			if extra < len(f.buf) {
+				copy(f.buf, f.buf[extra:])
+				f.buf = f.buf[:len(f.buf)-extra]
+			} else {
+				f.buf = f.buf[:0]
+			}
+			start = m - (cap(f.buf) - len(f.buf))
+		}
+		f.buf = append(f.buf, b[start:m]...)
+		f.readAt = len(f.buf)
+	}
+
+	return
+}
+
+var errSeekFailed = errors.New("io.File seek failed")
+var errWhence = errors.New("io.File invalid whence")
+var errOffset = errors.New("io.File invalid offset")
+
+func (f *ioFileStreamSeeker) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+		bufStart := f.pos - int64(len(f.buf))
+		if offset < bufStart {
+			return 0, errOffset
+		}
+		if offset > f.pos {
+			_, err := io.CopyN(io.Discard, f.file, offset-f.pos)
+			if err != nil {
+				return 0, errSeekFailed
+			}
+		} else {
+			f.readAt = int(offset - bufStart)
+		}
+		f.pos = offset
+
+		return f.pos, nil
+	case io.SeekCurrent:
+		return 0, errWhence
+	case io.SeekEnd:
+		return 0, errWhence
+	default:
+		return 0, errWhence
+	}
 }
 
 // FS converts fsys to a FileSystem implementation,
