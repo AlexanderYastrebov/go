@@ -113,4 +113,8 @@ type Flags struct {
 	// NewInliner enables a new+improved version of the function
 	// inlining phase within the Go compiler.
 	NewInliner bool
+
+	// TemplateDCE enables dead code elimination by disabling reflect.Value.MethodByName
+	// in the text/template package.
+	TemplateDCE bool
 }
