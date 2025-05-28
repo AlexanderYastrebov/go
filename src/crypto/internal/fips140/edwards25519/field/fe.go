@@ -13,6 +13,8 @@ import (
 	"math/bits"
 )
 
+var Multiplications int
+
 // Element represents an element of the field GF(2^255-19). Note that this
 // is not a cryptographically secure group, and should only be used to interact
 // with edwards25519.Point coordinates.
@@ -301,12 +303,14 @@ func (v *Element) Absolute(u *Element) *Element {
 
 // Multiply sets v = x * y, and returns v.
 func (v *Element) Multiply(x, y *Element) *Element {
+	Multiplications += 1
 	feMul(v, x, y)
 	return v
 }
 
 // Square sets v = x * x, and returns v.
 func (v *Element) Square(x *Element) *Element {
+	Multiplications += 1
 	feSquare(v, x)
 	return v
 }
