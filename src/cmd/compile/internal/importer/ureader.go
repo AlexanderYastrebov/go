@@ -439,17 +439,8 @@ func (pr *pkgReader) objIdx(idx pkgbits.Index) (*types2.Package, string) {
 			return types2.NewConst(pos, objPkg, objName, typ, val)
 
 		case pkgbits.ObjFunc:
-			pos := r.pos()
-			var rtparams []*types2.TypeParam
-			var recv *types2.Var
-			if r.Version().Has(pkgbits.GenericMethods) && r.Bool() {
-				r.selector()
-				rtparams = r.typeParamNames(false, true)
-				recv = r.param()
-			}
-			tparams := r.typeParamNames(false, false)
-			sig := r.signature(recv, rtparams, tparams)
-			return types2.NewFunc(pos, objPkg, objName, sig)
+			fn := pr.readObjFunc(r, objPkg, objName)
+			return fn
 
 		case pkgbits.ObjType:
 			pos := r.pos()
@@ -466,6 +457,16 @@ func (pr *pkgReader) objIdx(idx pkgbits.Index) (*types2.Package, string) {
 				methods := make([]*types2.Func, r.Len())
 				for i := range methods {
 					methods[i] = r.method(true)
+				}
+				// Read generic methods written as relocs in the ObjType section.
+				if r.Version().Has(pkgbits.GenericMethods) {
+					for range r.Len() {
+						idx := r.Reloc(pkgbits.SectionObj)
+						fn := pr.readGenericMethod(idx)
+						if fn != nil {
+							methods = append(methods, fn)
+						}
+					}
 				}
 
 				return tparams, underlying, methods, r.delayed
@@ -520,6 +521,47 @@ func (pr *pkgReader) objDictIdx(idx pkgbits.Index) *readerDict {
 	// function references follow, but reader doesn't need those
 
 	return &dict
+}
+
+// readGenericMethod loads the generic method object at idx and returns it.
+// It re-uses readObjFunc to avoid duplicating the ObjFunc parsing logic.
+func (pr *pkgReader) readGenericMethod(idx pkgbits.Index) *types2.Func {
+	dict := pr.objDictIdx(idx)
+	r := pr.newReader(pkgbits.SectionObj, idx, pkgbits.SyncObject1)
+	r.dict = dict
+
+	var objPkg *types2.Package
+	var objName string
+	{
+		rname := pr.tempReader(pkgbits.SectionName, idx, pkgbits.SyncObject1)
+		objPkg, objName = rname.qualifiedIdent()
+		pr.retireReader(rname)
+	}
+
+	return pr.readObjFunc(r, objPkg, objName)
+}
+
+// readObjFunc reads an ObjFunc record from r and returns the *types2.Func.
+// objName may be mangled as "TypeName.MethodName" for generic methods;
+// genericMethodName extracts the base name in that case.
+func (pr *pkgReader) readObjFunc(r *reader, objPkg *types2.Package, objName string) *types2.Func {
+	pos := r.pos()
+	var rtparams []*types2.TypeParam
+	var recv *types2.Var
+	isGenericMethod := r.Version().Has(pkgbits.GenericMethods) && r.Bool()
+	if isGenericMethod {
+		r.selector()
+		rtparams = r.typeParamNames(false, true)
+		recv = r.param()
+	}
+	tparams := r.typeParamNames(false, false)
+	sig := r.signature(recv, rtparams, tparams)
+	if isGenericMethod {
+		// objName is mangled as "TypeName.MethodName" by the writer.
+		// Extract just the method name for the Func object.
+		return types2.NewFunc(pos, objPkg, genericMethodName(objName), sig)
+	}
+	return types2.NewFunc(pos, objPkg, objName, sig)
 }
 
 func (r *reader) typeParamNames(isLazy bool, isGenMeth bool) []*types2.TypeParam {
@@ -600,6 +642,18 @@ func (r *reader) method(isLazy bool) *types2.Func {
 func (r *reader) qualifiedIdent() (*types2.Package, string) { return r.ident(pkgbits.SyncSym) }
 func (r *reader) localIdent() (*types2.Package, string)     { return r.ident(pkgbits.SyncLocalIdent) }
 func (r *reader) selector() (*types2.Package, string)       { return r.ident(pkgbits.SyncSelector) }
+
+// genericMethodName is the symmetric counterpart of the writer's qualifiedIdent,
+// which mangles a generic method's name as "TypeName.MethodName"
+// (see cmd/compile/internal/noder/writer.go). It returns the unqualified method name.
+func genericMethodName(mangledName string) string {
+	for i := 0; i < len(mangledName); i++ {
+		if mangledName[i] == '.' {
+			return mangledName[i+1:]
+		}
+	}
+	return mangledName
+}
 
 func (r *reader) ident(marker pkgbits.SyncMarker) (*types2.Package, string) {
 	r.Sync(marker)

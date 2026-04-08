@@ -513,14 +513,41 @@ func (pr *pkgReader) objIdx(idx pkgbits.Index) (*types.Package, string) {
 			pos := r.pos()
 			var rtparams []*types.TypeParam
 			var recv *types.Var
-			if r.Version().Has(pkgbits.GenericMethods) && r.Bool() {
+			isGenericMethod := r.Version().Has(pkgbits.GenericMethods) && r.Bool()
+			if isGenericMethod {
 				r.selector()
 				rtparams = r.typeParamNames(true)
 				recv = r.param(types.RecvVar)
 			}
 			tparams := r.typeParamNames(false)
 			sig := r.signature(recv, rtparams, tparams)
-			declare(types.NewFunc(pos, objPkg, objName, sig))
+			// For generic methods, objName is mangled as "TypeName.MethodName".
+			// Extract just the method name for the Func object.
+			methName := genericMethodName(objName)
+			fn := types.NewFunc(pos, objPkg, methName, sig)
+			declare(fn)
+			// For generic methods, also register the method on the named type.
+			// The named type's ObjType entry may not be processed yet, so defer.
+			if isGenericMethod {
+				typeName, _, _ := strings.Cut(objName, ".")
+				r.p.later(func() {
+					tobj := objPkg.Scope().Lookup(typeName)
+					if tobj == nil {
+						return
+					}
+					named, ok := tobj.Type().(*types.Named)
+					if !ok {
+						return
+					}
+					// Only add if not already present (idempotent).
+					for i := range named.NumMethods() {
+						if named.Method(i).Name() == methName {
+							return
+						}
+					}
+					named.AddMethod(fn)
+				})
+			}
 
 		case pkgbits.ObjType:
 			pos := r.pos()
@@ -562,6 +589,15 @@ func (pr *pkgReader) objIdx(idx pkgbits.Index) (*types.Package, string) {
 			for i, n := 0, r.Len(); i < n; i++ {
 				named.AddMethod(r.method())
 			}
+			// Read (and skip) the generic method relocs written by the writer.
+			// Generic methods are registered on the named type via the ObjFunc
+			// case's later() callbacks; we just need to consume the data here
+			// to keep the reader in sync.
+			if r.Version().Has(pkgbits.GenericMethods) {
+				for range r.Len() {
+					r.Reloc(pkgbits.SectionObj)
+				}
+			}
 
 		case pkgbits.ObjVar:
 			pos := r.pos()
@@ -584,7 +620,7 @@ func (pr *pkgReader) objDictIdx(idx pkgbits.Index) *readerDict {
 		}
 
 		nreceivers := 0
-		if r.Version().Has(pkgbits.GenericMethods) && r.Bool() {
+		if r.Version().Has(pkgbits.GenericMethods) {
 			nreceivers = r.Len()
 		}
 		nexplicits := r.Len()
@@ -690,6 +726,17 @@ func (r *reader) selector() (*types.Package, string)       { return r.ident(pkgb
 func (r *reader) ident(marker pkgbits.SyncMarker) (*types.Package, string) {
 	r.Sync(marker)
 	return r.pkg(), r.String()
+}
+
+// genericMethodName is the symmetric counterpart of the writer's qualifiedIdent,
+// which mangles a generic method's name as "TypeName.MethodName". It returns
+// the unqualified method name, or the input unchanged if there is no dot.
+func genericMethodName(mangledName string) string {
+	_, after, ok := strings.Cut(mangledName, ".")
+	if ok {
+		return after
+	}
+	return mangledName
 }
 
 // pkgScope returns pkg.Scope().

@@ -720,3 +720,106 @@ var _ issue63285.A[issue63285.B[any]]
 		t.Errorf("Check failed: %v", err)
 	}
 }
+
+func TestIssue77273(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	// This package only handles gc export data.
+	if runtime.Compiler != "gc" {
+		t.Skipf("gc-built packages not available (compiler = %s)", runtime.Compiler)
+	}
+
+	tmpdir := t.TempDir()
+	testoutdir := filepath.Join(tmpdir, "testdata")
+	if err := os.Mkdir(testoutdir, 0700); err != nil {
+		t.Fatalf("making output dir: %v", err)
+	}
+
+	compile(t, "testdata", "issue77273.go", testoutdir, nil)
+
+	pkg, err := Import(make(map[string]*types2.Package), "./testdata/issue77273", tmpdir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Look up the Stream type and verify its generic methods survived the round-trip.
+	streamObj := pkg.Scope().Lookup("Stream")
+	if streamObj == nil {
+		t.Fatal("Stream not found in imported package")
+	}
+	named, ok := streamObj.Type().(*types2.Named)
+	if !ok {
+		t.Fatalf("Stream is not a named type, got %T", streamObj.Type())
+	}
+
+	// Collect the method names present on Stream.
+	gotMethods := make(map[string]bool)
+	for i := 0; i < named.NumMethods(); i++ {
+		gotMethods[named.Method(i).Name()] = true
+	}
+
+	wantMethods := []string{"Map", "Reduce", "Filter", "ZipWith"}
+	for _, name := range wantMethods {
+		if !gotMethods[name] {
+			t.Errorf("Stream is missing generic method %q after import; got methods: %v", name, gotMethods)
+		}
+	}
+
+	// Verify that each generic method has the expected number of type parameters.
+	wantTParams := map[string]int{
+		"Map":     1, // [R any]
+		"Reduce":  1, // [R any]
+		"Filter":  1, // [U interface{~bool}]
+		"ZipWith": 1, // [R any]
+	}
+	for i := 0; i < named.NumMethods(); i++ {
+		m := named.Method(i)
+		sig, ok := m.Type().(*types2.Signature)
+		if !ok {
+			t.Errorf("method %s: type is not a Signature", m.Name())
+			continue
+		}
+		want, known := wantTParams[m.Name()]
+		if !known {
+			continue
+		}
+		if got := sig.TypeParams().Len(); got != want {
+			t.Errorf("method %s: got %d type params, want %d", m.Name(), got, want)
+		}
+		// Each generic method must also have a receiver.
+		if sig.Recv() == nil {
+			t.Errorf("method %s: missing receiver", m.Name())
+		}
+	}
+
+	// Verify the imported package can be used for type-checking code that calls the generic methods.
+	check := func(pkgname, src string, imports importMap) (*types2.Package, error) {
+		f, err := syntax.Parse(syntax.NewFileBase(pkgname), strings.NewReader(src), nil, nil, 0)
+		if err != nil {
+			return nil, err
+		}
+		config := &types2.Config{
+			Importer: imports,
+		}
+		return config.Check(pkgname, []*syntax.File{f}, nil)
+	}
+
+	const pSrc = `package p
+
+import "issue77273"
+
+func _() {
+	s := issue77273.Stream[int]{1, 2, 3}
+	var _ issue77273.Stream[string] = s.Map(func(x int) string { return "x" })
+	var _ int = s.Reduce(0, func(acc, x int) int { return acc + x })
+	var _ issue77273.Stream[int] = s.Filter(func(x int) bool { return x > 1 })
+	var _ []issue77273.Pair[int, string] = s.ZipWith(func(i, x int) string { return "v" })
+}
+`
+	importer := importMap{
+		"issue77273": pkg,
+	}
+	if _, err := check("p", pSrc, importer); err != nil {
+		t.Errorf("type-checking against imported package failed: %v", err)
+	}
+}
